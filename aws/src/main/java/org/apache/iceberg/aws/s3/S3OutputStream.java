@@ -85,10 +85,10 @@ class S3OutputStream extends PositionOutputStream {
   private long pos = 0;
   private boolean closed = false;
 
-  @SuppressWarnings({"StaticAssignmentInConstructor", "StaticGuardedByInstance"})
+  @SuppressWarnings("StaticAssignmentInConstructor")
   S3OutputStream(S3Client s3, S3URI location, AwsProperties awsProperties) throws IOException {
     if (executorService == null) {
-      synchronized (this) {
+      synchronized (S3OutputStream.class) {
         if (executorService == null) {
           executorService = MoreExecutors.getExitingExecutorService(
               (ThreadPoolExecutor) Executors.newFixedThreadPool(
@@ -109,7 +109,7 @@ class S3OutputStream extends PositionOutputStream {
 
     multiPartSize = awsProperties.s3FileIoMultiPartSize();
     multiPartThresholdSize =  (int) (multiPartSize * awsProperties.s3FileIOMultipartThresholdFactor());
-    stagingDirectory = new File(awsProperties.getS3fileIoStagingDirectory());
+    stagingDirectory = new File(awsProperties.s3fileIoStagingDirectory());
 
     newStream();
   }

@@ -26,7 +26,7 @@ import org.apache.iceberg.CombinedScanTask;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
-import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.encryption.EncryptionManager;
 import org.apache.iceberg.io.CloseableIterable;
@@ -37,7 +37,7 @@ import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
-import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.data.vectorized.VectorizedSparkOrcReaders;
 import org.apache.iceberg.spark.data.vectorized.VectorizedSparkParquetReaders;
 import org.apache.iceberg.types.TypeUtil;
@@ -68,18 +68,7 @@ class BatchDataReader extends BaseDataReader<ColumnarBatch> {
     // update the current file for Spark's filename() function
     InputFileBlockHolder.set(file.path().toString(), task.start(), task.length());
 
-    // schema or rows returned by readers
-    PartitionSpec spec = task.spec();
-    Set<Integer> idColumns = spec.identitySourceIds();
-    Schema partitionSchema = TypeUtil.select(expectedSchema, idColumns);
-    boolean projectsIdentityPartitionColumns = !partitionSchema.columns().isEmpty();
-
-    Map<Integer, ?> idToConstant;
-    if (projectsIdentityPartitionColumns) {
-      idToConstant = PartitionUtil.constantsMap(task, BatchDataReader::convertConstant);
-    } else {
-      idToConstant = ImmutableMap.of();
-    }
+    Map<Integer, ?> idToConstant = PartitionUtil.constantsMap(task, BatchDataReader::convertConstant);
 
     CloseableIterable<ColumnarBatch> iter;
     InputFile location = getInputFile(task);
@@ -104,9 +93,12 @@ class BatchDataReader extends BaseDataReader<ColumnarBatch> {
 
       iter = builder.build();
     } else if (task.file().format() == FileFormat.ORC) {
-      Schema schemaWithoutConstants = TypeUtil.selectNot(expectedSchema, idToConstant.keySet());
+      Set<Integer> constantFieldIds = idToConstant.keySet();
+      Set<Integer> metadataFieldIds = MetadataColumns.metadataFieldIds();
+      Sets.SetView<Integer> constantAndMetadataFieldIds = Sets.union(constantFieldIds, metadataFieldIds);
+      Schema schemaWithoutConstantAndMetadataFields = TypeUtil.selectNot(expectedSchema, constantAndMetadataFieldIds);
       ORC.ReadBuilder builder = ORC.read(location)
-          .project(schemaWithoutConstants)
+          .project(schemaWithoutConstantAndMetadataFields)
           .split(task.start(), task.length())
           .createBatchedReaderFunc(fileSchema -> VectorizedSparkOrcReaders.buildReader(expectedSchema, fileSchema,
               idToConstant))

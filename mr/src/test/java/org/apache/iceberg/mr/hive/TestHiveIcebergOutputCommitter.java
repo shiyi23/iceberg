@@ -23,10 +23,14 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
+import java.util.Properties;
 import org.apache.hadoop.hive.conf.HiveConf;
+import org.apache.hadoop.hive.ql.plan.TableDesc;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.JobContextImpl;
 import org.apache.hadoop.mapred.JobID;
+import org.apache.hadoop.mapred.OutputCommitter;
 import org.apache.hadoop.mapred.TaskAttemptContextImpl;
 import org.apache.hadoop.mapred.TaskAttemptID;
 import org.apache.hadoop.mapreduce.JobStatus;
@@ -42,14 +46,19 @@ import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.LocationProvider;
 import org.apache.iceberg.io.OutputFileFactory;
+import org.apache.iceberg.mr.Catalogs;
 import org.apache.iceberg.mr.TestHelper;
 import org.apache.iceberg.mr.mapred.Container;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
 import org.junit.Assert;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mockito;
 
+import static org.apache.iceberg.mr.hive.HiveIcebergRecordWriter.getWriter;
 import static org.apache.iceberg.types.Types.NestedField.required;
 
 public class TestHiveIcebergOutputCommitter {
@@ -177,6 +186,33 @@ public class TestHiveIcebergOutputCommitter {
     HiveIcebergTestUtils.validateData(table, Collections.emptyList(), 0);
   }
 
+  @Test
+  public void writerIsClosedAfterTaskCommitFailure() throws IOException {
+    HiveIcebergOutputCommitter committer = new HiveIcebergOutputCommitter();
+    HiveIcebergOutputCommitter failingCommitter = Mockito.spy(committer);
+    ArgumentCaptor<TaskAttemptContextImpl> argumentCaptor = ArgumentCaptor.forClass(TaskAttemptContextImpl.class);
+    String exceptionMessage = "Commit task failed!";
+    Mockito.doThrow(new RuntimeException(exceptionMessage))
+            .when(failingCommitter).commitTask(argumentCaptor.capture());
+
+    Table table = table(temp.getRoot().getPath(), false);
+    JobConf conf = jobConf(table, 1);
+    try {
+      writeRecords(1, 0, true, false, conf, failingCommitter);
+      Assert.fail();
+    } catch (RuntimeException e) {
+      Assert.assertTrue(e.getMessage().contains(exceptionMessage));
+    }
+
+    Assert.assertEquals(1, argumentCaptor.getAllValues().size());
+    TaskAttemptID capturedId = TezUtil.taskAttemptWrapper(argumentCaptor.getValue().getTaskAttemptID());
+    // writer is still in the map after commitTask failure
+    Assert.assertNotNull(getWriter(capturedId));
+    failingCommitter.abortTask(new TaskAttemptContextImpl(conf, capturedId));
+    // abortTask succeeds and removes writer
+    Assert.assertNull(getWriter(capturedId));
+  }
+
   private Table table(String location, boolean partitioned) {
     HadoopTables tables = new HadoopTables();
     return tables.create(CUSTOMER_SCHEMA, partitioned ? PARTITIONED_SPEC : PartitionSpec.unpartitioned(), location);
@@ -188,7 +224,13 @@ public class TestHiveIcebergOutputCommitter {
     conf.setNumReduceTasks(0);
     conf.set(HiveConf.ConfVars.HIVEQUERYID.varname, QUERY_ID);
 
-    HiveIcebergStorageHandler.put(conf, table);
+    Map<String, String> propMap = Maps.newHashMap();
+    TableDesc tableDesc = new TableDesc();
+    tableDesc.setProperties(new Properties());
+    tableDesc.getProperties().setProperty(Catalogs.NAME, table.name());
+    tableDesc.getProperties().setProperty(Catalogs.LOCATION, table.location());
+    HiveIcebergStorageHandler.overlayTableProperties(conf, tableDesc, propMap);
+    propMap.forEach((key, value) -> conf.set(key, value));
     return conf;
   }
 
@@ -201,11 +243,12 @@ public class TestHiveIcebergOutputCommitter {
    * @param abortTasks If <code>true</code> the tasks will be aborted - needed so we can simulate no commit/no abort
    *                   situation
    * @param conf The job configuration
+   * @param committer The output committer that should be used for committing/aborting the tasks
    * @return The random generated records which were appended to the table
    * @throws IOException Propagating {@link HiveIcebergRecordWriter} exceptions
    */
   private List<Record> writeRecords(int taskNum, int attemptNum, boolean commitTasks, boolean abortTasks,
-                                    JobConf conf) throws IOException {
+                                    JobConf conf, OutputCommitter committer) throws IOException {
     List<Record> expected = new ArrayList<>(RECORD_NUM * taskNum);
 
     FileIO io = HiveIcebergStorageHandler.io(conf);
@@ -221,7 +264,8 @@ public class TestHiveIcebergOutputCommitter {
           new OutputFileFactory(spec, FileFormat.PARQUET, location, io, encryption, taskId.getTaskID().getId(),
               attemptNum, QUERY_ID + "-" + JOB_ID);
       HiveIcebergRecordWriter testWriter = new HiveIcebergRecordWriter(schema, spec, FileFormat.PARQUET,
-          new GenericAppenderFactory(schema), outputFileFactory, io, TARGET_FILE_SIZE, taskId);
+          new GenericAppenderFactory(schema), outputFileFactory, io, TARGET_FILE_SIZE,
+          TezUtil.taskAttemptWrapper(taskId));
 
       Container<Record> container = new Container<>();
 
@@ -232,13 +276,18 @@ public class TestHiveIcebergOutputCommitter {
 
       testWriter.close(false);
       if (commitTasks) {
-        new HiveIcebergOutputCommitter().commitTask(new TaskAttemptContextImpl(conf, taskId));
+        committer.commitTask(new TaskAttemptContextImpl(conf, taskId));
         expected.addAll(records);
       } else if (abortTasks) {
-        new HiveIcebergOutputCommitter().abortTask(new TaskAttemptContextImpl(conf, taskId));
+        committer.abortTask(new TaskAttemptContextImpl(conf, taskId));
       }
     }
 
     return expected;
+  }
+
+  private List<Record> writeRecords(int taskNum, int attemptNum, boolean commitTasks, boolean abortTasks,
+                                    JobConf conf) throws IOException {
+    return writeRecords(taskNum, attemptNum, commitTasks, abortTasks, conf, new HiveIcebergOutputCommitter());
   }
 }

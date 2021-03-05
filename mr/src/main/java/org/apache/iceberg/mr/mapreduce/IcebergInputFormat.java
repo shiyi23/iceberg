@@ -49,6 +49,7 @@ import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.data.DeleteFilter;
 import org.apache.iceberg.data.GenericDeleteFilter;
 import org.apache.iceberg.data.IdentityPartitionConverters;
+import org.apache.iceberg.data.InternalRecordWrapper;
 import org.apache.iceberg.data.avro.DataReader;
 import org.apache.iceberg.data.orc.GenericOrcReader;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
@@ -63,7 +64,6 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mr.Catalogs;
 import org.apache.iceberg.mr.InputFormatConfig;
-import org.apache.iceberg.mr.SerializationUtil;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -71,8 +71,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.util.PartitionUtil;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import org.apache.iceberg.util.SerializationUtil;
 
 /**
  * Generic Mrv2 InputFormat API for Iceberg.
@@ -80,8 +79,6 @@ import org.slf4j.LoggerFactory;
  * @param <T> T is the in memory data model which can either be Pig tuples, Hive rows. Default is Iceberg records
  */
 public class IcebergInputFormat<T> extends InputFormat<Void, T> {
-  private static final Logger LOG = LoggerFactory.getLogger(IcebergInputFormat.class);
-
   /**
    * Configures the {@code Job} to use the {@code IcebergInputFormat} and
    * returns a helper to add further configuration.
@@ -96,9 +93,15 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
   @Override
   public List<InputSplit> getSplits(JobContext context) {
     Configuration conf = context.getConfiguration();
-    Table table = Catalogs.loadTable(conf);
+    Table table;
+    if (conf.get(InputFormatConfig.SERIALIZED_TABLE) != null) {
+      table = SerializationUtil.deserializeFromBase64(conf.get(InputFormatConfig.SERIALIZED_TABLE));
+    } else {
+      table = Catalogs.loadTable(conf);
+    }
+
     TableScan scan = table.newScan()
-            .caseSensitive(conf.getBoolean(InputFormatConfig.CASE_SENSITIVE, true));
+            .caseSensitive(conf.getBoolean(InputFormatConfig.CASE_SENSITIVE, InputFormatConfig.CASE_SENSITIVE_DEFAULT));
     long snapshotId = conf.getLong(InputFormatConfig.SNAPSHOT_ID, -1);
     if (snapshotId != -1) {
       scan = scan.useSnapshot(snapshotId);
@@ -186,9 +189,9 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
       this.encryptionManager = ((IcebergSplit) split).encryptionManager();
       this.tasks = task.files().iterator();
       this.tableSchema = InputFormatConfig.tableSchema(conf);
-      this.expectedSchema = readSchema(conf, tableSchema);
+      this.caseSensitive = conf.getBoolean(InputFormatConfig.CASE_SENSITIVE, InputFormatConfig.CASE_SENSITIVE_DEFAULT);
+      this.expectedSchema = readSchema(conf, tableSchema, caseSensitive);
       this.reuseContainers = conf.getBoolean(InputFormatConfig.REUSE_CONTAINERS, false);
-      this.caseSensitive = conf.getBoolean(InputFormatConfig.CASE_SENSITIVE, true);
       this.inMemoryDataModel = conf.getEnum(InputFormatConfig.IN_MEMORY_DATA_MODEL,
               InputFormatConfig.InMemoryDataModel.GENERIC);
       this.currentIterator = open(tasks.next(), expectedSchema).iterator();
@@ -282,8 +285,11 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
       boolean applyResidual = !context.getConfiguration().getBoolean(InputFormatConfig.SKIP_RESIDUAL_FILTERING, false);
 
       if (applyResidual && residual != null && residual != Expressions.alwaysTrue()) {
+        // Date and timestamp values are not the correct type for Evaluator.
+        // Wrapping to return the expected type.
+        InternalRecordWrapper wrapper = new InternalRecordWrapper(readSchema.asStruct());
         Evaluator filter = new Evaluator(readSchema.asStruct(), residual, caseSensitive);
-        return CloseableIterable.filter(iter, record -> filter.eval((StructLike) record));
+        return CloseableIterable.filter(iter, record -> filter.eval(wrapper.wrap((StructLike) record)));
       } else {
         return iter;
       }
@@ -371,7 +377,7 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
       }
     }
 
-    private static Schema readSchema(Configuration conf, Schema tableSchema) {
+    private static Schema readSchema(Configuration conf, Schema tableSchema, boolean caseSensitive) {
       Schema readSchema = InputFormatConfig.readSchema(conf);
 
       if (readSchema != null) {
@@ -379,7 +385,11 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
       }
 
       String[] selectedColumns = InputFormatConfig.selectedColumns(conf);
-      return selectedColumns != null ? tableSchema.select(selectedColumns) : tableSchema;
+      if (selectedColumns == null) {
+        return tableSchema;
+      }
+
+      return caseSensitive ? tableSchema.select(selectedColumns) : tableSchema.caseInsensitiveSelect(selectedColumns);
     }
   }
 

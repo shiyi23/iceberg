@@ -116,7 +116,7 @@ class Writer implements DataSourceWriter {
 
     long tableTargetFileSize = PropertyUtil.propertyAsLong(
         table.properties(), WRITE_TARGET_FILE_SIZE_BYTES, WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT);
-    this.targetFileSize = options.getLong("target-file-size-bytes", tableTargetFileSize);
+    this.targetFileSize = options.getLong(SparkWriteOptions.TARGET_FILE_SIZE_BYTES, tableTargetFileSize);
 
     boolean tablePartitionedFanoutEnabled = PropertyUtil.propertyAsBoolean(
         table.properties(), SPARK_WRITE_PARTITIONED_FANOUT_ENABLED, SPARK_WRITE_PARTITIONED_FANOUT_ENABLED_DEFAULT);
@@ -124,7 +124,7 @@ class Writer implements DataSourceWriter {
   }
 
   private FileFormat getFileFormat(Map<String, String> tableProperties, DataSourceOptions options) {
-    Optional<String> formatOption = options.get("write-format");
+    Optional<String> formatOption = options.get(SparkWriteOptions.WRITE_FORMAT);
     String formatString = formatOption
         .orElseGet(() -> tableProperties.getOrDefault(DEFAULT_FILE_FORMAT, DEFAULT_FILE_FORMAT_DEFAULT));
     return FileFormat.valueOf(formatString.toUpperCase(Locale.ENGLISH));
@@ -278,7 +278,7 @@ class Writer implements DataSourceWriter {
           spec, format, locations, io.value(), encryptionManager.value(), partitionId, taskId);
       SparkAppenderFactory appenderFactory = new SparkAppenderFactory(properties, writeSchema, dsSchema, spec);
 
-      if (spec.fields().isEmpty()) {
+      if (spec.isUnpartitioned()) {
         return new Unpartitioned24Writer(spec, format, appenderFactory, fileFactory, io.value(), targetFileSize);
       } else if (partitionedFanoutEnabled) {
         return new PartitionedFanout24Writer(spec, format, appenderFactory, fileFactory, io.value(), targetFileSize,

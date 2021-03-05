@@ -40,6 +40,7 @@ import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.data.GenericsHelpers;
 import org.apache.iceberg.transforms.Transform;
 import org.apache.iceberg.transforms.Transforms;
@@ -439,7 +440,7 @@ public class TestFilteredScan {
   public void testUnpartitionedStartsWith() {
     Dataset<Row> df = spark.read()
         .format("iceberg")
-        .option("vectorization-enabled", String.valueOf(vectorized))
+        .option(SparkReadOptions.VECTORIZATION_ENABLED, String.valueOf(vectorized))
         .load(unpartitioned.toString());
 
     List<String> matchedData = df.select("data")
@@ -506,7 +507,7 @@ public class TestFilteredScan {
     // copy the unpartitioned table into the partitioned table to produce the partitioned data
     Dataset<Row> allRows = spark.read()
         .format("iceberg")
-        .option("vectorization-enabled", String.valueOf(vectorized))
+        .option(SparkReadOptions.VECTORIZATION_ENABLED, String.valueOf(vectorized))
         .load(unpartitioned.toString());
 
     allRows
@@ -528,7 +529,7 @@ public class TestFilteredScan {
     return Lists.newArrayList(
         record(schema, 0L, parse("2017-12-22T09:20:44.294658+00:00"), "junction"),
         record(schema, 1L, parse("2017-12-22T07:15:34.582910+00:00"), "alligator"),
-        record(schema, 2L, parse("2017-12-22T06:02:09.243857+00:00"), "forrest"),
+        record(schema, 2L, parse("2017-12-22T06:02:09.243857+00:00"), ""),
         record(schema, 3L, parse("2017-12-22T03:10:11.134509+00:00"), "clapping"),
         record(schema, 4L, parse("2017-12-22T00:34:00.184671+00:00"), "brush"),
         record(schema, 5L, parse("2017-12-21T22:20:08.935889+00:00"), "trap"),
@@ -545,7 +546,7 @@ public class TestFilteredScan {
 
   private static List<Row> read(String table, boolean vectorized, String expr, String select0, String... selectN) {
     Dataset<Row> dataset = spark.read().format("iceberg")
-        .option("vectorization-enabled", String.valueOf(vectorized))
+        .option(SparkReadOptions.VECTORIZATION_ENABLED, String.valueOf(vectorized))
         .load(table).filter(expr)
         .select(select0, selectN);
     return dataset.collectAsList();

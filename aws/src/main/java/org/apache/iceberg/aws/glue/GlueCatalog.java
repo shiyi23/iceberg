@@ -28,11 +28,12 @@ import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configurable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.BaseMetastoreCatalog;
+import org.apache.iceberg.BaseMetastoreTableOperations;
 import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.TableMetadata;
 import org.apache.iceberg.TableOperations;
-import org.apache.iceberg.aws.AwsClientUtil;
+import org.apache.iceberg.aws.AwsClientFactories;
 import org.apache.iceberg.aws.AwsProperties;
 import org.apache.iceberg.aws.s3.S3FileIO;
 import org.apache.iceberg.catalog.Namespace;
@@ -72,43 +73,51 @@ public class GlueCatalog extends BaseMetastoreCatalog implements Closeable, Supp
 
   private static final Logger LOG = LoggerFactory.getLogger(GlueCatalog.class);
 
-  private final GlueClient glue;
+  private GlueClient glue;
   private Configuration hadoopConf;
   private String catalogName;
   private String warehousePath;
   private AwsProperties awsProperties;
   private FileIO fileIO;
+  private LockManager lockManager;
 
   /**
    * No-arg constructor to load the catalog dynamically.
    * <p>
-   * Only the AWS Glue client is initialized.
-   * Other fields must be initialized by calling {@link GlueCatalog#initialize(String, Map)} later.
+   * All fields are initialized by calling {@link GlueCatalog#initialize(String, Map)} later.
    */
   public GlueCatalog() {
-    this(AwsClientUtil.defaultGlueClient());
-  }
-
-  @VisibleForTesting
-  GlueCatalog(GlueClient glue) {
-    this.glue = glue;
   }
 
   @Override
   public void initialize(String name, Map<String, String> properties) {
-    String fileIOImpl = properties.get(CatalogProperties.FILE_IO_IMPL);
     initialize(
         name,
         properties.get(CatalogProperties.WAREHOUSE_LOCATION),
         new AwsProperties(properties),
-        fileIOImpl == null ? new S3FileIO() : CatalogUtil.loadFileIO(fileIOImpl, properties, hadoopConf));
+        AwsClientFactories.from(properties).glue(),
+        LockManagers.from(properties),
+        initializeFileIO(properties));
+  }
+
+  private FileIO initializeFileIO(Map<String, String> properties) {
+    String fileIOImpl = properties.get(CatalogProperties.FILE_IO_IMPL);
+    if (fileIOImpl == null) {
+      FileIO io = new S3FileIO();
+      io.initialize(properties);
+      return io;
+    } else {
+      return CatalogUtil.loadFileIO(fileIOImpl, properties, hadoopConf);
+    }
   }
 
   @VisibleForTesting
-  void initialize(String name, String path, AwsProperties properties, FileIO io) {
+  void initialize(String name, String path, AwsProperties properties, GlueClient client, LockManager lock, FileIO io) {
     this.catalogName = name;
     this.awsProperties = properties;
     this.warehousePath = cleanWarehousePath(path);
+    this.glue = client;
+    this.lockManager = lock;
     this.fileIO = io;
   }
 
@@ -125,7 +134,7 @@ public class GlueCatalog extends BaseMetastoreCatalog implements Closeable, Supp
 
   @Override
   protected TableOperations newTableOps(TableIdentifier tableIdentifier) {
-    return new GlueTableOperations(glue, catalogName, awsProperties, fileIO, tableIdentifier);
+    return new GlueTableOperations(glue, lockManager, catalogName, awsProperties, fileIO, tableIdentifier);
   }
 
   /**
@@ -168,6 +177,7 @@ public class GlueCatalog extends BaseMetastoreCatalog implements Closeable, Supp
       nextToken = response.nextToken();
       if (response.hasTableList()) {
         results.addAll(response.tableList().stream()
+            .filter(this::isGlueIcebergTable)
             .map(GlueToIcebergConverter::toTableId)
             .collect(Collectors.toList()));
       }
@@ -175,6 +185,12 @@ public class GlueCatalog extends BaseMetastoreCatalog implements Closeable, Supp
 
     LOG.debug("Listing of namespace: {} resulted in the following tables: {}", namespace, results);
     return results;
+  }
+
+  private boolean isGlueIcebergTable(Table table) {
+    return table.parameters() != null &&
+        BaseMetastoreTableOperations.ICEBERG_TABLE_TYPE_VALUE.equalsIgnoreCase(
+            table.parameters().get(BaseMetastoreTableOperations.TABLE_TYPE_PROP));
   }
 
   @Override
@@ -328,10 +344,21 @@ public class GlueCatalog extends BaseMetastoreCatalog implements Closeable, Supp
   @Override
   public boolean dropNamespace(Namespace namespace) throws NamespaceNotEmptyException {
     namespaceExists(namespace);
-    List<TableIdentifier> tableIdentifiers = listTables(namespace);
-    if (tableIdentifiers != null && !tableIdentifiers.isEmpty()) {
-      throw new NamespaceNotEmptyException("Cannot drop namespace %s because it is not empty. " +
-          "The following tables still exist under the namespace: %s", namespace, tableIdentifiers);
+
+    GetTablesResponse response = glue.getTables(GetTablesRequest.builder()
+        .catalogId(awsProperties.glueCatalogId())
+        .databaseName(IcebergToGlueConverter.toDatabaseName(namespace))
+        .build());
+
+    if (response.hasTableList() && !response.tableList().isEmpty()) {
+      Table table = response.tableList().get(0);
+      if (isGlueIcebergTable(table)) {
+        throw new NamespaceNotEmptyException(
+            "Cannot drop namespace %s because it still contains Iceberg tables", namespace);
+      } else {
+        throw new NamespaceNotEmptyException(
+            "Cannot drop namespace %s because it still contains non-Iceberg tables", namespace);
+      }
     }
 
     glue.deleteDatabase(DeleteDatabaseRequest.builder()

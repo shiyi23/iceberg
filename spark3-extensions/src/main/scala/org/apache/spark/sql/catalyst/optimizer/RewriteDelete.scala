@@ -19,91 +19,84 @@
 
 package org.apache.spark.sql.catalyst.optimizer
 
-import java.util.UUID
-import org.apache.spark.internal.Logging
-import org.apache.spark.sql.{sources, AnalysisException}
-import org.apache.spark.sql.catalyst.expressions.{Alias, Ascending, Attribute, AttributeReference, EqualNullSafe, Expression, InputFileName, Literal, Not, PredicateHelper, SortOrder, SubqueryExpression}
-import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, DeleteFromTable, DynamicFileFilter, Filter, LogicalPlan, Project, RepartitionByExpression, ReplaceData, Sort}
+import org.apache.iceberg.DistributionMode
+import org.apache.iceberg.spark.Spark3Util
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.expressions.Ascending
+import org.apache.spark.sql.catalyst.expressions.AttributeReference
+import org.apache.spark.sql.catalyst.expressions.EqualNullSafe
+import org.apache.spark.sql.catalyst.expressions.Expression
+import org.apache.spark.sql.catalyst.expressions.Literal
+import org.apache.spark.sql.catalyst.expressions.Not
+import org.apache.spark.sql.catalyst.expressions.SortOrder
+import org.apache.spark.sql.catalyst.expressions.SubqueryExpression
+import org.apache.spark.sql.catalyst.plans.logical.DeleteFromTable
+import org.apache.spark.sql.catalyst.plans.logical.Filter
+import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
+import org.apache.spark.sql.catalyst.plans.logical.Project
+import org.apache.spark.sql.catalyst.plans.logical.RepartitionByExpression
+import org.apache.spark.sql.catalyst.plans.logical.ReplaceData
+import org.apache.spark.sql.catalyst.plans.logical.Sort
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.utils.PlanUtils.isIcebergRelation
+import org.apache.spark.sql.catalyst.utils.RewriteRowLevelOperationHelper
 import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.connector.iceberg.catalog.ExtendedSupportsDelete
-import org.apache.spark.sql.connector.iceberg.read.SupportsFileFilter
-import org.apache.spark.sql.connector.iceberg.write.MergeBuilder
-import org.apache.spark.sql.connector.write.{LogicalWriteInfo, LogicalWriteInfoImpl}
 import org.apache.spark.sql.execution.datasources.DataSourceStrategy
-import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, DataSourceV2ScanRelation, PushDownUtils}
+import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.apache.spark.sql.execution.datasources.v2.ExtendedDataSourceV2Implicits
 import org.apache.spark.sql.internal.SQLConf
-import org.apache.spark.sql.types.{BooleanType, StructType}
-import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.sql.types.BooleanType
 
-// TODO: should be part of early scan push down after the delete condition is optimized
-object RewriteDelete extends Rule[LogicalPlan] with PredicateHelper with Logging {
+case class RewriteDelete(spark: SparkSession) extends Rule[LogicalPlan] with RewriteRowLevelOperationHelper {
 
-  import org.apache.spark.sql.execution.datasources.v2.ExtendedDataSourceV2Implicits._
+  import ExtendedDataSourceV2Implicits._
+  import RewriteRowLevelOperationHelper._
 
-  private val FILE_NAME_COL = "_file"
-
-  override def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperators {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan transform {
     // don't rewrite deletes that can be answered by passing filters to deleteWhere in SupportsDelete
-    case d @ DeleteFromTable(r: DataSourceV2Relation, Some(cond)) if isMetadataDelete(r, cond) =>
+    case d @ DeleteFromTable(r: DataSourceV2Relation, Some(cond))
+        if isMetadataDelete(r, cond) && isIcebergRelation(r) =>
       d
 
     // rewrite all operations that require reading the table to delete records
-    case DeleteFromTable(r: DataSourceV2Relation, Some(cond)) =>
+    case DeleteFromTable(r: DataSourceV2Relation, Some(cond)) if isIcebergRelation(r) =>
       // TODO: do a switch based on whether we get BatchWrite or DeltaBatchWrite
       val writeInfo = newWriteInfo(r.schema)
       val mergeBuilder = r.table.asMergeable.newMergeBuilder("delete", writeInfo)
 
-      val scanPlan = buildScanPlan(r.table, r.output, mergeBuilder, cond)
+      val matchingRowsPlanBuilder = scanRelation => Filter(cond, scanRelation)
+      val scanPlan = buildDynamicFilterScanPlan(spark, r.table, r.output, mergeBuilder, cond, matchingRowsPlanBuilder)
 
       val remainingRowFilter = Not(EqualNullSafe(cond, Literal(true, BooleanType)))
       val remainingRowsPlan = Filter(remainingRowFilter, scanPlan)
 
       val mergeWrite = mergeBuilder.asWriteBuilder.buildForBatch()
-      val writePlan = buildWritePlan(remainingRowsPlan, r.output)
+      val writePlan = buildWritePlan(remainingRowsPlan, r.table, r.output)
       ReplaceData(r, mergeWrite, writePlan)
-  }
-
-  private def buildScanPlan(
-      table: Table,
-      output: Seq[AttributeReference],
-      mergeBuilder: MergeBuilder,
-      cond: Expression): LogicalPlan = {
-
-    val scanBuilder = mergeBuilder.asScanBuilder
-
-    val predicates = splitConjunctivePredicates(cond)
-    val normalizedPredicates = DataSourceStrategy.normalizeExprs(predicates, output)
-    PushDownUtils.pushFilters(scanBuilder, normalizedPredicates)
-
-    val scan = scanBuilder.build()
-    val scanRelation = DataSourceV2ScanRelation(table, scan, output)
-
-    val scanPlan = scan match {
-      case _: SupportsFileFilter =>
-        val matchingFilePlan = buildFileFilterPlan(cond, scanRelation)
-        val dynamicFileFilter = DynamicFileFilter(scanRelation, matchingFilePlan)
-        dynamicFileFilter
-      case _ =>
-        scanRelation
-    }
-
-    // include file name so that we can group data back
-    val fileNameExpr = Alias(InputFileName(), FILE_NAME_COL)()
-    Project(scanPlan.output :+ fileNameExpr, scanPlan)
   }
 
   private def buildWritePlan(
       remainingRowsPlan: LogicalPlan,
+      table: Table,
       output: Seq[AttributeReference]): LogicalPlan = {
 
-    // TODO: sort by _pos to keep the original ordering of rows
-    // TODO: consider setting a file size limit
+    val fileNameCol = findOutputAttr(remainingRowsPlan.output, FILE_NAME_COL)
+    val rowPosCol = findOutputAttr(remainingRowsPlan.output, ROW_POS_COL)
 
-    val fileNameCol = findOutputAttr(remainingRowsPlan, FILE_NAME_COL)
-    val numShufflePartitions = SQLConf.get.numShufflePartitions
-    val repartition = RepartitionByExpression(Seq(fileNameCol), remainingRowsPlan, numShufflePartitions)
-    val sort = Sort(Seq(SortOrder(fileNameCol, Ascending)), global = false, repartition)
+    val icebergTable = Spark3Util.toIcebergTable(table)
+    val distributionMode = Spark3Util.distributionModeFor(icebergTable)
+    val planWithDistribution = distributionMode match {
+      case DistributionMode.NONE =>
+        remainingRowsPlan
+      case _ =>
+        // apply hash partitioning by file if the distribution mode is hash or range
+        val numShufflePartitions = SQLConf.get.numShufflePartitions
+        RepartitionByExpression(Seq(fileNameCol), remainingRowsPlan, numShufflePartitions)
+    }
+
+    val order = Seq(SortOrder(fileNameCol, Ascending), SortOrder(rowPosCol, Ascending))
+    val sort = Sort(order, global = false, planWithDistribution)
     Project(output, sort)
   }
 
@@ -116,37 +109,6 @@ object RewriteDelete extends Rule[LogicalPlan] with PredicateHelper with Logging
         val allPredicatesTranslated = normalizedPredicates.size == dataSourceFilters.length
         allPredicatesTranslated && t.canDeleteWhere(dataSourceFilters)
       case _ => false
-    }
-  }
-
-  private def toDataSourceFilters(predicates: Seq[Expression]): Array[sources.Filter] = {
-    predicates.flatMap { p =>
-      val translatedFilter = DataSourceStrategy.translateFilter(p, supportNestedPredicatePushdown = true)
-      if (translatedFilter.isEmpty) {
-        logWarning(s"Cannot translate expression to source filter: $p")
-      }
-      translatedFilter
-    }.toArray
-  }
-
-  private def newWriteInfo(schema: StructType): LogicalWriteInfo = {
-    val uuid = UUID.randomUUID()
-    LogicalWriteInfoImpl(queryId = uuid.toString, schema, CaseInsensitiveStringMap.empty)
-  }
-
-  private def buildFileFilterPlan(cond: Expression, scanRelation: DataSourceV2ScanRelation): LogicalPlan = {
-    val fileNameExpr = Alias(InputFileName(), FILE_NAME_COL)()
-    val fileNameProjection = Project(scanRelation.output :+ fileNameExpr, scanRelation)
-    val matchingFilter = Filter(cond, fileNameProjection)
-    val fileAttr = findOutputAttr(matchingFilter, FILE_NAME_COL)
-    val agg = Aggregate(Seq(fileAttr), Seq(fileAttr), matchingFilter)
-    Project(Seq(findOutputAttr(agg, FILE_NAME_COL)), agg)
-  }
-
-  private def findOutputAttr(plan: LogicalPlan, attrName: String): Attribute = {
-    val resolver = SQLConf.get.resolver
-    plan.output.find(attr => resolver(attr.name, attrName)).getOrElse {
-      throw new AnalysisException(s"Cannot find $attrName in ${plan.output}")
     }
   }
 }

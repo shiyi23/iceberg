@@ -67,7 +67,7 @@ public abstract class BaseRewriteDataFilesAction<ThisT>
   private int splitLookback;
   private long splitOpenFileCost;
 
-  public BaseRewriteDataFilesAction(Table table) {
+  protected BaseRewriteDataFilesAction(Table table) {
     this.table = table;
     this.spec = table.spec();
     this.filter = Expressions.alwaysTrue();
@@ -226,11 +226,16 @@ public abstract class BaseRewriteDataFilesAction<ThisT>
           return TableScanUtil.planTasks(splitTasks, targetSizeInBytes, splitLookback, splitOpenFileCost);
         })
         .flatMap(Streams::stream)
+        .filter(task -> task.files().size() > 1 || isPartialFileScan(task))
         .collect(Collectors.toList());
 
+    if (combinedScanTasks.isEmpty()) {
+      return RewriteDataFilesActionResult.empty();
+    }
+
     List<DataFile> addedDataFiles = rewriteDataForTasks(combinedScanTasks);
-    List<DataFile> currentDataFiles = filteredGroupedTasks.values().stream()
-        .flatMap(tasks -> tasks.stream().map(FileScanTask::file))
+    List<DataFile> currentDataFiles = combinedScanTasks.stream()
+        .flatMap(tasks -> tasks.files().stream().map(FileScanTask::file))
         .collect(Collectors.toList());
     replaceDataFiles(currentDataFiles, addedDataFiles);
 
@@ -265,6 +270,15 @@ public abstract class BaseRewriteDataFilesAction<ThisT>
           .onFailure((location, exc) -> LOG.warn("Failed to delete: {}", location, exc))
           .run(fileIO::deleteFile);
       throw e;
+    }
+  }
+
+  private boolean isPartialFileScan(CombinedScanTask task) {
+    if (task.files().size() == 1) {
+      FileScanTask fileScanTask = task.files().iterator().next();
+      return fileScanTask.file().fileSizeInBytes() != fileScanTask.length();
+    } else {
+      return false;
     }
   }
 

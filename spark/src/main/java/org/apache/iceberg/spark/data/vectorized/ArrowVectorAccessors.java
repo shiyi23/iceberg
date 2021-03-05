@@ -56,10 +56,10 @@ public class ArrowVectorAccessors {
   static ArrowVectorAccessor getVectorAccessor(VectorHolder holder) {
     Dictionary dictionary = holder.dictionary();
     boolean isVectorDictEncoded = holder.isDictionaryEncoded();
-    ColumnDescriptor desc = holder.descriptor();
     FieldVector vector = holder.vector();
-    PrimitiveType primitive = desc.getPrimitiveType();
     if (isVectorDictEncoded) {
+      ColumnDescriptor desc = holder.descriptor();
+      PrimitiveType primitive = desc.getPrimitiveType();
       return getDictionaryVectorAccessor(dictionary, desc, vector, primitive);
     } else {
       return getPlainVectorAccessor(vector);
@@ -184,6 +184,11 @@ public class ArrowVectorAccessors {
     final int getInt(int rowId) {
       return vector.get(rowId);
     }
+
+    @Override
+    final long getLong(int rowId) {
+      return getInt(rowId);
+    }
   }
 
   private static class LongAccessor extends ArrowVectorAccessor {
@@ -232,6 +237,11 @@ public class ArrowVectorAccessors {
     final float getFloat(int rowId) {
       return vector.get(rowId);
     }
+
+    @Override
+    final double getDouble(int rowId) {
+      return getFloat(rowId);
+    }
   }
 
   private static class DictionaryFloatAccessor extends ArrowVectorAccessor {
@@ -250,6 +260,11 @@ public class ArrowVectorAccessors {
     @Override
     final float getFloat(int rowId) {
       return decodedDictionary[offsetVector.get(rowId)];
+    }
+
+    @Override
+    final double getDouble(int rowId) {
+      return getFloat(rowId);
     }
   }
 

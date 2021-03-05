@@ -21,6 +21,9 @@ package org.apache.iceberg.flink.sink;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -29,38 +32,45 @@ import org.apache.flink.api.common.typeinfo.TypeInformation;
 import org.apache.flink.api.java.typeutils.RowTypeInfo;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
-import org.apache.flink.streaming.util.FiniteTestSource;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.data.util.DataFormatConverters;
-import org.apache.flink.table.runtime.typeutils.RowDataTypeInfo;
-import org.apache.flink.test.util.AbstractTestBase;
+import org.apache.flink.test.util.MiniClusterWithClientResource;
 import org.apache.flink.types.Row;
+import org.apache.iceberg.AssertHelpers;
+import org.apache.iceberg.DistributionMode;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.flink.MiniClusterResource;
 import org.apache.iceberg.flink.SimpleDataUtil;
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.source.BoundedTestSource;
+import org.apache.iceberg.flink.util.FlinkCompatibilityUtil;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
-import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.Assert;
 import org.junit.Before;
-import org.junit.Rule;
+import org.junit.ClassRule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
 @RunWith(Parameterized.class)
-public class TestFlinkIcebergSink extends AbstractTestBase {
+public class TestFlinkIcebergSink {
+
+  @ClassRule
+  public static final MiniClusterWithClientResource MINI_CLUSTER_RESOURCE =
+      MiniClusterResource.createWithClassloaderCheckDisabled();
+
+  @ClassRule
+  public static final TemporaryFolder TEMPORARY_FOLDER = new TemporaryFolder();
+
   private static final TypeInformation<Row> ROW_TYPE_INFO = new RowTypeInfo(
       SimpleDataUtil.FLINK_SCHEMA.getFieldTypes());
   private static final DataFormatConverters.RowConverter CONVERTER = new DataFormatConverters.RowConverter(
       SimpleDataUtil.FLINK_SCHEMA.getFieldDataTypes());
-
-  @Rule
-  public TemporaryFolder tempFolder = new TemporaryFolder();
 
   private String tablePath;
   private Table table;
@@ -97,7 +107,7 @@ public class TestFlinkIcebergSink extends AbstractTestBase {
 
   @Before
   public void before() throws IOException {
-    File folder = tempFolder.newFolder();
+    File folder = TEMPORARY_FOLDER.newFolder();
     String warehouse = folder.getAbsolutePath();
 
     tablePath = warehouse.concat("/test");
@@ -106,7 +116,7 @@ public class TestFlinkIcebergSink extends AbstractTestBase {
     Map<String, String> props = ImmutableMap.of(TableProperties.DEFAULT_FILE_FORMAT, format.name());
     table = SimpleDataUtil.createTable(tablePath, props, partitioned);
 
-    env = StreamExecutionEnvironment.getExecutionEnvironment()
+    env = StreamExecutionEnvironment.getExecutionEnvironment(MiniClusterResource.DISABLE_CLASSLOADER_CHECK_CONFIG)
         .enableCheckpointing(100)
         .setParallelism(parallelism)
         .setMaxParallelism(parallelism);
@@ -118,6 +128,10 @@ public class TestFlinkIcebergSink extends AbstractTestBase {
     return rows.stream().map(CONVERTER::toInternal).collect(Collectors.toList());
   }
 
+  private BoundedTestSource<Row> createBoundedSource(List<Row> rows) {
+    return new BoundedTestSource<>(rows.toArray(new Row[0]));
+  }
+
   @Test
   public void testWriteRowData() throws Exception {
     List<Row> rows = Lists.newArrayList(
@@ -125,8 +139,8 @@ public class TestFlinkIcebergSink extends AbstractTestBase {
         Row.of(2, "world"),
         Row.of(3, "foo")
     );
-    DataStream<RowData> dataStream = env.addSource(new FiniteTestSource<>(rows), ROW_TYPE_INFO)
-        .map(CONVERTER::toInternal, RowDataTypeInfo.of(SimpleDataUtil.ROW_TYPE));
+    DataStream<RowData> dataStream = env.addSource(createBoundedSource(rows), ROW_TYPE_INFO)
+        .map(CONVERTER::toInternal, FlinkCompatibilityUtil.toTypeInfo(SimpleDataUtil.ROW_TYPE));
 
     FlinkSink.forRowData(dataStream)
         .table(table)
@@ -137,40 +151,116 @@ public class TestFlinkIcebergSink extends AbstractTestBase {
     // Execute the program.
     env.execute("Test Iceberg DataStream");
 
-    // Assert the iceberg table's records. NOTICE: the FiniteTestSource will checkpoint the same rows twice, so it will
-    // commit the same row list into iceberg twice.
-    List<RowData> expectedRows = Lists.newArrayList(Iterables.concat(convertToRowData(rows), convertToRowData(rows)));
-    SimpleDataUtil.assertTableRows(tablePath, expectedRows);
+    // Assert the iceberg table's records.
+    SimpleDataUtil.assertTableRows(tablePath, convertToRowData(rows));
   }
 
-  private void testWriteRow(TableSchema tableSchema) throws Exception {
+  private void testWriteRow(TableSchema tableSchema, DistributionMode distributionMode) throws Exception {
     List<Row> rows = Lists.newArrayList(
-        Row.of(4, "bar"),
-        Row.of(5, "apache")
+        Row.of(1, "aaa"),
+        Row.of(1, "bbb"),
+        Row.of(1, "ccc"),
+        Row.of(2, "aaa"),
+        Row.of(2, "bbb"),
+        Row.of(2, "ccc"),
+        Row.of(3, "aaa"),
+        Row.of(3, "bbb"),
+        Row.of(3, "ccc")
     );
-    DataStream<Row> dataStream = env.addSource(new FiniteTestSource<>(rows), ROW_TYPE_INFO);
+    DataStream<Row> dataStream = env.addSource(createBoundedSource(rows), ROW_TYPE_INFO);
 
     FlinkSink.forRow(dataStream, SimpleDataUtil.FLINK_SCHEMA)
         .table(table)
         .tableLoader(tableLoader)
         .tableSchema(tableSchema)
         .writeParallelism(parallelism)
+        .distributionMode(distributionMode)
         .build();
 
     // Execute the program.
     env.execute("Test Iceberg DataStream.");
 
-    List<RowData> expectedRows = Lists.newArrayList(Iterables.concat(convertToRowData(rows), convertToRowData(rows)));
-    SimpleDataUtil.assertTableRows(tablePath, expectedRows);
+    SimpleDataUtil.assertTableRows(tablePath, convertToRowData(rows));
+  }
+
+  private List<Path> partitionFiles(String partition) throws IOException {
+    return Files.list(Paths.get(tablePath, "data", String.format("data=%s", partition)))
+        .filter(p -> !p.toString().endsWith(".crc"))
+        .collect(Collectors.toList());
   }
 
   @Test
   public void testWriteRow() throws Exception {
-    testWriteRow(null);
+    testWriteRow(null, DistributionMode.NONE);
   }
 
   @Test
   public void testWriteRowWithTableSchema() throws Exception {
-    testWriteRow(SimpleDataUtil.FLINK_SCHEMA);
+    testWriteRow(SimpleDataUtil.FLINK_SCHEMA, DistributionMode.NONE);
+  }
+
+  @Test
+  public void testJobNoneDistributeMode() throws Exception {
+    table.updateProperties()
+        .set(TableProperties.WRITE_DISTRIBUTION_MODE, DistributionMode.HASH.modeName())
+        .commit();
+
+    testWriteRow(null, DistributionMode.NONE);
+
+    if (parallelism > 1) {
+      if (partitioned) {
+        int files = partitionFiles("aaa").size() + partitionFiles("bbb").size() + partitionFiles("ccc").size();
+        Assert.assertTrue("Should have more than 3 files in iceberg table.", files > 3);
+      }
+    }
+  }
+
+  @Test
+  public void testJobHashDistributionMode() {
+    table.updateProperties()
+        .set(TableProperties.WRITE_DISTRIBUTION_MODE, DistributionMode.HASH.modeName())
+        .commit();
+
+    AssertHelpers.assertThrows("Does not support range distribution-mode now.",
+        IllegalArgumentException.class, "Flink does not support 'range' write distribution mode now.",
+        () -> {
+          testWriteRow(null, DistributionMode.RANGE);
+          return null;
+        });
+  }
+
+  @Test
+  public void testJobNullDistributionMode() throws Exception {
+    table.updateProperties()
+        .set(TableProperties.WRITE_DISTRIBUTION_MODE, DistributionMode.HASH.modeName())
+        .commit();
+
+    testWriteRow(null, null);
+
+    if (partitioned) {
+      Assert.assertEquals("There should be only 1 data file in partition 'aaa'", 1, partitionFiles("aaa").size());
+      Assert.assertEquals("There should be only 1 data file in partition 'bbb'", 1, partitionFiles("bbb").size());
+      Assert.assertEquals("There should be only 1 data file in partition 'ccc'", 1, partitionFiles("ccc").size());
+    }
+  }
+
+  @Test
+  public void testPartitionWriteMode() throws Exception {
+    testWriteRow(null, DistributionMode.HASH);
+    if (partitioned) {
+      Assert.assertEquals("There should be only 1 data file in partition 'aaa'", 1, partitionFiles("aaa").size());
+      Assert.assertEquals("There should be only 1 data file in partition 'bbb'", 1, partitionFiles("bbb").size());
+      Assert.assertEquals("There should be only 1 data file in partition 'ccc'", 1, partitionFiles("ccc").size());
+    }
+  }
+
+  @Test
+  public void testShuffleByPartitionWithSchema() throws Exception {
+    testWriteRow(SimpleDataUtil.FLINK_SCHEMA, DistributionMode.HASH);
+    if (partitioned) {
+      Assert.assertEquals("There should be only 1 data file in partition 'aaa'", 1, partitionFiles("aaa").size());
+      Assert.assertEquals("There should be only 1 data file in partition 'bbb'", 1, partitionFiles("bbb").size());
+      Assert.assertEquals("There should be only 1 data file in partition 'ccc'", 1, partitionFiles("ccc").size());
+    }
   }
 }

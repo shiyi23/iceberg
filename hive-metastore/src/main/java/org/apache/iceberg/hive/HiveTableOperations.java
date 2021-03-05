@@ -27,7 +27,9 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.common.StatsSetupConst;
 import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
@@ -186,7 +188,15 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
             baseMetadataLocation, metadataLocation, database, tableName);
       }
 
-      setParameters(newMetadataLocation, tbl, hiveEngineEnabled);
+      // get Iceberg props that have been removed
+      Set<String> removedProps = Collections.emptySet();
+      if (base != null) {
+        removedProps = base.properties().keySet().stream()
+            .filter(key -> !metadata.properties().containsKey(key))
+            .collect(Collectors.toSet());
+      }
+
+      setHmsTableParameters(newMetadataLocation, tbl, metadata.properties(), removedProps, hiveEngineEnabled);
 
       persistTable(tbl, updateHiveTable);
       threw = false;
@@ -207,11 +217,7 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
       throw new RuntimeException("Interrupted during commit", e);
 
     } finally {
-      if (threw) {
-        // if anything went wrong, clean up the uncommitted metadata file
-        io().deleteFile(newMetadataLocation);
-      }
-      unlock(lockId);
+      cleanupMetadataAndUnlock(threw, newMetadataLocation, lockId);
     }
   }
 
@@ -261,12 +267,19 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
     return newTable;
   }
 
-  private void setParameters(String newMetadataLocation, Table tbl, boolean hiveEngineEnabled) {
+  private void setHmsTableParameters(String newMetadataLocation, Table tbl, Map<String, String> icebergTableProps,
+                                     Set<String> obsoleteProps, boolean hiveEngineEnabled) {
     Map<String, String> parameters = tbl.getParameters();
 
     if (parameters == null) {
       parameters = new HashMap<>();
     }
+
+    // push all Iceberg table properties into HMS
+    icebergTableProps.forEach(parameters::put);
+
+    // remove any props from HMS that are no longer present in Iceberg table props
+    obsoleteProps.forEach(parameters::remove);
 
     parameters.put(TABLE_TYPE_PROP, ICEBERG_TABLE_TYPE_VALUE.toUpperCase(Locale.ENGLISH));
     parameters.put(METADATA_LOCATION_PROP, newMetadataLocation);
@@ -319,8 +332,8 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
     long duration = 0;
     boolean timeout = false;
 
-    if (state.get().equals(LockState.WAITING)) {
-      try {
+    try {
+      if (state.get().equals(LockState.WAITING)) {
         // Retry count is the typical "upper bound of retries" for Tasks.run() function. In fact, the maximum number of
         // attempts the Tasks.run() would try is `retries + 1`. Here, for checking locks, we use timeout as the
         // upper bound of retries. So it is just reasonable to set a large retry count. However, if we set
@@ -348,9 +361,13 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
                 LOG.warn("Interrupted while waiting for lock.", e);
               }
             }, TException.class);
-      } catch (WaitingForLockException waitingForLockException) {
-        timeout = true;
-        duration = System.currentTimeMillis() - start;
+      }
+    } catch (WaitingForLockException waitingForLockException) {
+      timeout = true;
+      duration = System.currentTimeMillis() - start;
+    } finally {
+      if (!state.get().equals(LockState.ACQUIRED)) {
+        unlock(Optional.of(lockId));
       }
     }
 
@@ -365,6 +382,20 @@ public class HiveTableOperations extends BaseMetastoreTableOperations {
           "lock request ended in state %s", database, tableName, state);
     }
     return lockId;
+  }
+
+  private void cleanupMetadataAndUnlock(boolean errorThrown, String metadataLocation, Optional<Long> lockId) {
+    try {
+      if (errorThrown) {
+        // if anything went wrong, clean up the uncommitted metadata file
+        io().deleteFile(metadataLocation);
+      }
+    } catch (RuntimeException e) {
+      LOG.error("Fail to cleanup metadata file at {}", metadataLocation, e);
+      throw e;
+    } finally {
+      unlock(lockId);
+    }
   }
 
   private void unlock(Optional<Long> lockId) {

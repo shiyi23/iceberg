@@ -40,6 +40,7 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.Spark3Util;
+import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.TableScanUtil;
 import org.apache.spark.broadcast.Broadcast;
@@ -82,13 +83,13 @@ class SparkMergeScan extends SparkBatchScan implements SupportsFileFilter {
     Map<String, String> props = table.properties();
 
     long tableSplitSize = PropertyUtil.propertyAsLong(props, SPLIT_SIZE, SPLIT_SIZE_DEFAULT);
-    this.splitSize = Spark3Util.propertyAsLong(options, "split-size", tableSplitSize);
+    this.splitSize = Spark3Util.propertyAsLong(options, SparkReadOptions.SPLIT_SIZE, tableSplitSize);
 
     int tableSplitLookback = PropertyUtil.propertyAsInt(props, SPLIT_LOOKBACK, SPLIT_LOOKBACK_DEFAULT);
-    this.splitLookback = Spark3Util.propertyAsInt(options, "lookback", tableSplitLookback);
+    this.splitLookback = Spark3Util.propertyAsInt(options, SparkReadOptions.LOOKBACK, tableSplitLookback);
 
     long tableOpenFileCost = PropertyUtil.propertyAsLong(props, SPLIT_OPEN_FILE_COST, SPLIT_OPEN_FILE_COST_DEFAULT);
-    this.splitOpenFileCost = Spark3Util.propertyAsLong(options, "file-open-cost", tableOpenFileCost);
+    this.splitOpenFileCost = Spark3Util.propertyAsLong(options, SparkReadOptions.FILE_OPEN_COST, tableOpenFileCost);
 
     Preconditions.checkArgument(!options.containsKey("snapshot-id"), "Cannot have snapshot-id in options");
     Snapshot currentSnapshot = table.currentSnapshot();
@@ -120,7 +121,7 @@ class SparkMergeScan extends SparkBatchScan implements SupportsFileFilter {
   }
 
   // should be accessible to the write
-  List<FileScanTask> files() {
+  synchronized List<FileScanTask> files() {
     if (files == null) {
       TableScan scan = table
           .newScan()
@@ -147,7 +148,7 @@ class SparkMergeScan extends SparkBatchScan implements SupportsFileFilter {
   }
 
   @Override
-  protected List<CombinedScanTask> tasks() {
+  protected synchronized List<CombinedScanTask> tasks() {
     if (tasks == null) {
       CloseableIterable<FileScanTask> splitFiles = TableScanUtil.splitFiles(
           CloseableIterable.withNoopClose(files()),

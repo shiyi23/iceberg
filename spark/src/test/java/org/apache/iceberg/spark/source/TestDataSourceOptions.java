@@ -20,10 +20,12 @@
 package org.apache.iceberg.spark.source;
 
 import java.io.IOException;
+import java.math.RoundingMode;
 import java.util.List;
 import java.util.Map;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.AssertHelpers;
+import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.ManifestFile;
@@ -35,11 +37,15 @@ import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.math.LongMath;
+import org.apache.iceberg.spark.SparkReadOptions;
+import org.apache.iceberg.spark.SparkWriteOptions;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Encoders;
 import org.apache.spark.sql.Row;
+import org.apache.spark.sql.SaveMode;
 import org.apache.spark.sql.SparkSession;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -92,8 +98,8 @@ public abstract class TestDataSourceOptions {
     Dataset<Row> df = spark.createDataFrame(expectedRecords, SimpleRecord.class);
     df.select("id", "data").write()
         .format("iceberg")
-        .option("write-format", "parquet")
-        .mode("append")
+        .option(SparkWriteOptions.WRITE_FORMAT, "parquet")
+        .mode(SaveMode.Append)
         .save(tableLocation);
 
     try (CloseableIterable<FileScanTask> tasks = table.newScan().planFiles()) {
@@ -182,21 +188,29 @@ public abstract class TestDataSourceOptions {
     PartitionSpec spec = PartitionSpec.unpartitioned();
     Map<String, String> options = Maps.newHashMap();
     options.put(TableProperties.SPLIT_SIZE, String.valueOf(128L * 1024 * 1024)); // 128Mb
-    tables.create(SCHEMA, spec, options, tableLocation);
+    Table icebergTable = tables.create(SCHEMA, spec, options, tableLocation);
 
     List<SimpleRecord> expectedRecords = Lists.newArrayList(
         new SimpleRecord(1, "a"),
         new SimpleRecord(2, "b")
     );
     Dataset<Row> originalDf = spark.createDataFrame(expectedRecords, SimpleRecord.class);
-    originalDf.select("id", "data").write()
+    originalDf.select("id", "data")
+        .repartition(1)
+        .write()
         .format("iceberg")
         .mode("append")
         .save(tableLocation);
 
+    List<DataFile> files = Lists.newArrayList(icebergTable.currentSnapshot().addedFiles());
+    Assert.assertEquals("Should have written 1 file", 1, files.size());
+
+    long fileSize = files.get(0).fileSizeInBytes();
+    long splitSize = LongMath.divide(fileSize, 2, RoundingMode.CEILING);
+
     Dataset<Row> resultDf = spark.read()
         .format("iceberg")
-        .option("split-size", String.valueOf(611)) // 611 bytes is the size of SimpleRecord(1,"a")
+        .option(SparkReadOptions.SPLIT_SIZE, String.valueOf(splitSize))
         .load(tableLocation);
 
     Assert.assertEquals("Spark partitions should match", 2, resultDf.javaRDD().getNumPartitions());
@@ -247,7 +261,8 @@ public abstract class TestDataSourceOptions {
         () -> {
           spark.read()
               .format("iceberg")
-              .option("as-of-timestamp", Long.toString(table.snapshot(snapshotIds.get(3)).timestampMillis()))
+              .option(SparkReadOptions.AS_OF_TIMESTAMP,
+                  Long.toString(table.snapshot(snapshotIds.get(3)).timestampMillis()))
               .option("end-snapshot-id", snapshotIds.get(2).toString())
               .load(tableLocation).explain();
         });
@@ -328,7 +343,7 @@ public abstract class TestDataSourceOptions {
     // override the table property using options
     entriesDf = spark.read()
         .format("iceberg")
-        .option("split-size", String.valueOf(128 * 1024 * 1024))
+        .option(SparkReadOptions.SPLIT_SIZE, String.valueOf(128 * 1024 * 1024))
         .load(tableLocation + "#entries");
     Assert.assertEquals("Num partitions must match", 1, entriesDf.javaRDD().getNumPartitions());
   }
@@ -379,8 +394,8 @@ public abstract class TestDataSourceOptions {
     originalDf.select("id", "data").write()
             .format("iceberg")
             .mode("append")
-            .option("snapshot-property.extra-key", "someValue")
-            .option("snapshot-property.another-key", "anotherValue")
+            .option(SparkWriteOptions.SNAPSHOT_PROPERTY_PREFIX + ".extra-key", "someValue")
+            .option(SparkWriteOptions.SNAPSHOT_PROPERTY_PREFIX + ".another-key", "anotherValue")
             .save(tableLocation);
 
     Table table = tables.load(tableLocation);

@@ -19,7 +19,11 @@
 
 package org.apache.iceberg.spark.source;
 
+import java.util.Collections;
 import java.util.List;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.encryption.EncryptionManager;
@@ -32,6 +36,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.SparkFilters;
 import org.apache.iceberg.spark.SparkSchemaUtil;
 import org.apache.iceberg.spark.SparkUtil;
+import org.apache.iceberg.types.TypeUtil;
+import org.apache.iceberg.types.Types;
 import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.sql.SparkSession;
@@ -40,6 +46,7 @@ import org.apache.spark.sql.connector.read.ScanBuilder;
 import org.apache.spark.sql.connector.read.SupportsPushDownFilters;
 import org.apache.spark.sql.connector.read.SupportsPushDownRequiredColumns;
 import org.apache.spark.sql.sources.Filter;
+import org.apache.spark.sql.types.StructField;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.util.CaseInsensitiveStringMap;
 
@@ -49,6 +56,7 @@ public class SparkScanBuilder implements ScanBuilder, SupportsPushDownFilters, S
   private final SparkSession spark;
   private final Table table;
   private final CaseInsensitiveStringMap options;
+  private final List<String> metaColumns = Lists.newArrayList();
 
   private Schema schema = null;
   private StructType requestedProjection;
@@ -93,6 +101,11 @@ public class SparkScanBuilder implements ScanBuilder, SupportsPushDownFilters, S
     return Expressions.alwaysTrue();
   }
 
+  public SparkScanBuilder withMetadataColumns(String... metadataColumns) {
+    Collections.addAll(metaColumns, metadataColumns);
+    return this;
+  }
+
   public SparkScanBuilder caseSensitive(boolean isCaseSensitive) {
     this.caseSensitive = isCaseSensitive;
     return this;
@@ -131,7 +144,15 @@ public class SparkScanBuilder implements ScanBuilder, SupportsPushDownFilters, S
 
   @Override
   public void pruneColumns(StructType requestedSchema) {
-    this.requestedProjection = requestedSchema;
+    this.requestedProjection = new StructType(Stream.of(requestedSchema.fields())
+        .filter(field -> MetadataColumns.nonMetadataColumn(field.name()))
+        .toArray(StructField[]::new));
+
+    Stream.of(requestedSchema.fields())
+        .map(StructField::name)
+        .filter(MetadataColumns::isMetadataColumn)
+        .distinct()
+        .forEach(metaColumns::add);
   }
 
   public SparkScanBuilder ignoreResiduals() {
@@ -139,12 +160,25 @@ public class SparkScanBuilder implements ScanBuilder, SupportsPushDownFilters, S
     return this;
   }
 
+  private Schema schemaWithMetadataColumns() {
+    // metadata columns
+    List<Types.NestedField> fields = metaColumns.stream()
+        .distinct()
+        .map(MetadataColumns::get)
+        .collect(Collectors.toList());
+    Schema meta = new Schema(fields);
+
+    // schema or rows returned by readers
+    return TypeUtil.join(lazySchema(), meta);
+  }
+
   @Override
   public Scan build() {
     Broadcast<FileIO> io = lazySparkContext().broadcast(SparkUtil.serializableFileIO(table));
     Broadcast<EncryptionManager> encryption = lazySparkContext().broadcast(table.encryption());
 
-    return new SparkBatchQueryScan(table, io, encryption, caseSensitive, lazySchema(), filterExpressions, options);
+    return new SparkBatchQueryScan(
+        table, io, encryption, caseSensitive, schemaWithMetadataColumns(), filterExpressions, options);
   }
 
   public Scan buildMergeScan() {
@@ -153,6 +187,6 @@ public class SparkScanBuilder implements ScanBuilder, SupportsPushDownFilters, S
 
     return new SparkMergeScan(
         table, io, encryption, caseSensitive, ignoreResiduals,
-        lazySchema(), filterExpressions, options);
+        schemaWithMetadataColumns(), filterExpressions, options);
   }
 }

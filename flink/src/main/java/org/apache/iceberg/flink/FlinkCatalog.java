@@ -69,6 +69,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
 import org.apache.iceberg.exceptions.NamespaceNotEmptyException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
+import org.apache.iceberg.flink.util.FlinkCompatibilityUtil;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
@@ -308,7 +309,7 @@ public class FlinkCatalog extends AbstractCatalog {
     return toCatalogTable(table);
   }
 
-  Table loadIcebergTable(ObjectPath tablePath) throws TableNotExistException {
+  private Table loadIcebergTable(ObjectPath tablePath) throws TableNotExistException {
     try {
       Table table = icebergCatalog.loadTable(toIdentifier(tablePath));
       if (cacheEnabled) {
@@ -332,7 +333,9 @@ public class FlinkCatalog extends AbstractCatalog {
     try {
       icebergCatalog.dropTable(toIdentifier(tablePath));
     } catch (org.apache.iceberg.exceptions.NoSuchTableException e) {
-      throw new TableNotExistException(getName(), tablePath, e);
+      if (!ignoreIfNotExists) {
+        throw new TableNotExistException(getName(), tablePath, e);
+      }
     }
   }
 
@@ -344,7 +347,9 @@ public class FlinkCatalog extends AbstractCatalog {
           toIdentifier(tablePath),
           toIdentifier(new ObjectPath(tablePath.getDatabaseName(), newTableName)));
     } catch (org.apache.iceberg.exceptions.NoSuchTableException e) {
-      throw new TableNotExistException(getName(), tablePath, e);
+      if (!ignoreIfNotExists) {
+        throw new TableNotExistException(getName(), tablePath, e);
+      }
     } catch (AlreadyExistsException e) {
       throw new TableAlreadyExistException(getName(), tablePath, e);
     }
@@ -376,7 +381,9 @@ public class FlinkCatalog extends AbstractCatalog {
           location,
           properties.build());
     } catch (AlreadyExistsException e) {
-      throw new TableAlreadyExistException(getName(), tablePath, e);
+      if (!ignoreIfExists) {
+        throw new TableAlreadyExistException(getName(), tablePath, e);
+      }
     }
   }
 
@@ -384,7 +391,18 @@ public class FlinkCatalog extends AbstractCatalog {
   public void alterTable(ObjectPath tablePath, CatalogBaseTable newTable, boolean ignoreIfNotExists)
       throws CatalogException, TableNotExistException {
     validateFlinkTable(newTable);
-    Table icebergTable = loadIcebergTable(tablePath);
+
+    Table icebergTable;
+    try {
+      icebergTable = loadIcebergTable(tablePath);
+    } catch (TableNotExistException e) {
+      if (!ignoreIfNotExists) {
+        throw e;
+      } else {
+        return;
+      }
+    }
+
     CatalogTable table = toCatalogTable(icebergTable);
 
     // Currently, Flink SQL only support altering table properties.
@@ -439,7 +457,7 @@ public class FlinkCatalog extends AbstractCatalog {
 
     TableSchema schema = table.getSchema();
     schema.getTableColumns().forEach(column -> {
-      if (column.isGenerated()) {
+      if (!FlinkCompatibilityUtil.isPhysicalColumn(column)) {
         throw new UnsupportedOperationException("Creating table with computed columns is not supported yet.");
       }
     });

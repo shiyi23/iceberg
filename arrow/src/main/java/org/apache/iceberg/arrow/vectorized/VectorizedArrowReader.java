@@ -23,6 +23,7 @@ import java.util.Map;
 import org.apache.arrow.memory.BufferAllocator;
 import org.apache.arrow.vector.BigIntVector;
 import org.apache.arrow.vector.BitVector;
+import org.apache.arrow.vector.BitVectorHelper;
 import org.apache.arrow.vector.DateDayVector;
 import org.apache.arrow.vector.DecimalVector;
 import org.apache.arrow.vector.FieldVector;
@@ -30,9 +31,12 @@ import org.apache.arrow.vector.Float4Vector;
 import org.apache.arrow.vector.Float8Vector;
 import org.apache.arrow.vector.IntVector;
 import org.apache.arrow.vector.TimeStampMicroTZVector;
+import org.apache.arrow.vector.types.FloatingPointPrecision;
 import org.apache.arrow.vector.types.pojo.ArrowType;
 import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.arrow.vector.types.pojo.FieldType;
+import org.apache.iceberg.MetadataColumns;
+import org.apache.iceberg.arrow.ArrowAllocation;
 import org.apache.iceberg.arrow.ArrowSchemaUtil;
 import org.apache.iceberg.arrow.vectorized.parquet.VectorizedColumnIterator;
 import org.apache.iceberg.parquet.ParquetUtil;
@@ -276,13 +280,21 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
             this.typeWidth = UNKNOWN_WIDTH;
             break;
           case INT32:
-            this.vec = arrowField.createVector(rootAlloc);
+            Field intField = new Field(
+                    icebergField.name(),
+                    new FieldType(icebergField.isOptional(), new ArrowType.Int(Integer.SIZE, true),
+                            null, null), null);
+            this.vec = intField.createVector(rootAlloc);
             ((IntVector) vec).allocateNew(batchSize);
             this.readType = ReadType.INT;
             this.typeWidth = (int) IntVector.TYPE_WIDTH;
             break;
           case FLOAT:
-            this.vec = arrowField.createVector(rootAlloc);
+            Field floatField = new Field(
+                    icebergField.name(),
+                    new FieldType(icebergField.isOptional(), new ArrowType.FloatingPoint(FloatingPointPrecision.SINGLE),
+                            null, null), null);
+            this.vec = floatField.createVector(rootAlloc);
             ((Float4Vector) vec).allocateNew(batchSize);
             this.readType = ReadType.FLOAT;
             this.typeWidth = (int) Float4Vector.TYPE_WIDTH;
@@ -313,7 +325,7 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
   }
 
   @Override
-  public void setRowGroupInfo(PageReadStore source, Map<ColumnPath, ColumnChunkMetaData> metadata) {
+  public void setRowGroupInfo(PageReadStore source, Map<ColumnPath, ColumnChunkMetaData> metadata, long rowPosition) {
     ColumnChunkMetaData chunkMetaData = metadata.get(ColumnPath.get(columnDescriptor.getPath()));
     this.dictionary = vectorizedColumnIterator.setRowGroupInfo(
         source.getPageReader(columnDescriptor),
@@ -336,6 +348,10 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
     return NullVectorReader.INSTANCE;
   }
 
+  public static VectorizedArrowReader positions() {
+    return new PositionVectorReader();
+  }
+
   private static final class NullVectorReader extends VectorizedArrowReader {
     private static final NullVectorReader INSTANCE = new NullVectorReader();
 
@@ -345,12 +361,57 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
     }
 
     @Override
-    public void setRowGroupInfo(PageReadStore source, Map<ColumnPath, ColumnChunkMetaData> metadata) {
+    public void setRowGroupInfo(PageReadStore source, Map<ColumnPath, ColumnChunkMetaData> metadata, long rowPosition) {
     }
 
     @Override
     public String toString() {
       return "NullReader";
+    }
+
+    @Override
+    public void setBatchSize(int batchSize) {
+    }
+  }
+
+  private static final class PositionVectorReader extends VectorizedArrowReader {
+    private long rowStart;
+    private NullabilityHolder nulls;
+
+    @Override
+    public VectorHolder read(VectorHolder reuse, int numValsToRead) {
+      Field arrowField = ArrowSchemaUtil.convert(MetadataColumns.ROW_POSITION);
+      FieldVector vec = arrowField.createVector(ArrowAllocation.rootAllocator());
+
+      if (reuse != null) {
+        vec.setValueCount(0);
+        nulls.reset();
+      } else {
+        ((BigIntVector) vec).allocateNew(numValsToRead);
+        for (int i = 0; i < numValsToRead; i += 1) {
+          vec.getDataBuffer().setLong(i * Long.BYTES, rowStart + i);
+        }
+        for (int i = 0; i < numValsToRead; i += 1) {
+          BitVectorHelper.setValidityBitToOne(vec.getValidityBuffer(), i);
+        }
+        nulls = new NullabilityHolder(numValsToRead);
+      }
+
+      rowStart += numValsToRead;
+      vec.setValueCount(numValsToRead);
+      nulls.setNotNulls(0, numValsToRead);
+
+      return new VectorHolder.PositionVectorHolder(vec, MetadataColumns.ROW_POSITION.type(), nulls);
+    }
+
+    @Override
+    public void setRowGroupInfo(PageReadStore source, Map<ColumnPath, ColumnChunkMetaData> metadata, long rowPosition) {
+      this.rowStart = rowPosition;
+    }
+
+    @Override
+    public String toString() {
+      return getClass().toString();
     }
 
     @Override
@@ -376,7 +437,7 @@ public class VectorizedArrowReader implements VectorizedReader<VectorHolder> {
     }
 
     @Override
-    public void setRowGroupInfo(PageReadStore source, Map<ColumnPath, ColumnChunkMetaData> metadata) {
+    public void setRowGroupInfo(PageReadStore source, Map<ColumnPath, ColumnChunkMetaData> metadata, long rowPosition) {
     }
 
     @Override
